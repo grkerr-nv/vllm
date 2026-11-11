@@ -56,6 +56,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqMeta,
     compute_nixl_compatibility_hash,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
     has_kv_transfer_group,
@@ -216,6 +217,80 @@ class FakeNixlWrapper:
 
     def get_xfer_telemetry(self, handle: int) -> dict:
         return get_default_xfer_telemetry()
+
+
+@pytest.mark.parametrize(
+    "failures,release_fails,backend_error",
+    [(1, False, True), (5, False, True), (1, True, True), (1, False, False)],
+    ids=["recovers", "exhausted", "release-fails", "other-error"],
+)
+def test_read_submission_retries(
+    default_vllm_config, dist_init, failures, release_fails, backend_error
+):
+    """Retry transient submissions without leaking or reusing failed handles."""
+
+    class BackendError(Exception):
+        pass
+
+    error = BackendError("backend") if backend_error else ValueError("invalid")
+    wrapper = FakeNixlWrapper("read-retry")
+    with (
+        patch.object(wrapper, "make_prepped_xfer", side_effect=range(1, 7)),
+        patch.object(
+            wrapper, "transfer", side_effect=[error] * failures + ["PROC"]
+        ) as transfer,
+        patch.object(
+            wrapper,
+            "release_xfer_handle",
+            side_effect=RuntimeError("release") if release_fails else None,
+        ) as release,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+            return_value=wrapper,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker.NixlBackendError",
+            BackendError,
+            create=True,
+        ),
+    ):
+        block_size = maybe_update_block_size(16)
+        config = create_vllm_config(block_size=block_size)
+        worker = FakeNixlConnectorWorker(
+            config,
+            "read-retry",
+            hand_shake_latency=0,
+            kv_cache_config=make_kv_cache_config(block_size=block_size),
+        )
+        worker._nixl_handshake("localhost", 1234, 1, worker.REMOTE_ENGINE_ID)
+        posted = worker._read_blocks(
+            ReadSpec(0, ([1],), ([2],)),
+            worker.REMOTE_ENGINE_ID,
+            "request",
+            "prefill",
+            10,
+            None,
+            20,
+            1,
+            True,
+        )
+        if failures < 5 and not release_fails and backend_error:
+            assert posted
+            assert worker._recving_transfers == {"request": [2]}
+            assert not worker._recv_failures
+        else:
+            assert not posted
+            assert worker._recv_failures == {"request"}
+            assert worker._recving_transfers == (
+                {"request": [1]} if release_fails else {}
+            )
+        attempts = (
+            5 if failures == 5 else 2 if backend_error and not release_fails else 1
+        )
+        assert transfer.call_args_list == [call(i) for i in range(1, attempts + 1)]
+        assert release.call_args_list == [
+            call(i) for i in range(1, attempts if attempts == 2 else attempts + 1)
+        ]
 
 
 @contextlib.contextmanager
