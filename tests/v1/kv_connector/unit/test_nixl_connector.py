@@ -56,6 +56,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqMeta,
     compute_nixl_compatibility_hash,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
     has_kv_transfer_group,
@@ -216,6 +217,89 @@ class FakeNixlWrapper:
 
     def get_xfer_telemetry(self, handle: int) -> dict:
         return get_default_xfer_telemetry()
+
+
+_PULL_WORKER = "vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker"
+
+
+class _BackendError(Exception):
+    """Stand-in for NIXL's nixlBackendError."""
+
+
+@pytest.mark.parametrize(
+    "transfer_errors,release_fails,posted,transfers,releases,tracked",
+    [
+        pytest.param([_BackendError()], False, True, [1, 2], [1], [2], id="recovers"),
+        pytest.param(
+            [_BackendError()] * 5,
+            False,
+            False,
+            [1, 2, 3, 4, 5],
+            [1, 2, 3, 4, 5],
+            [],
+            id="exhausted",
+        ),
+        pytest.param(
+            [_BackendError()], True, False, [1], [1], [1], id="release-fails"
+        ),
+        pytest.param([ValueError()], False, False, [1], [1], [], id="other-error"),
+    ],
+)
+def test_read_submission_retries(
+    default_vllm_config,
+    dist_init,
+    transfer_errors,
+    release_fails,
+    posted,
+    transfers,
+    releases,
+    tracked,
+):
+    """Retry transient submissions without leaking or reusing failed handles."""
+    wrapper = FakeNixlWrapper("read-retry")
+    with (
+        patch.object(wrapper, "make_prepped_xfer", side_effect=range(1, 7)),
+        patch.object(
+            wrapper, "transfer", side_effect=[*transfer_errors, "PROC"]
+        ) as transfer,
+        patch.object(
+            wrapper,
+            "release_xfer_handle",
+            side_effect=RuntimeError("release") if release_fails else None,
+        ) as release,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+            return_value=wrapper,
+        ),
+        patch(f"{_PULL_WORKER}.NixlBackendError", _BackendError),
+    ):
+        block_size = maybe_update_block_size(16)
+        config = create_vllm_config(block_size=block_size)
+        worker = FakeNixlConnectorWorker(
+            config,
+            "read-retry",
+            hand_shake_latency=0,
+            kv_cache_config=make_kv_cache_config(block_size=block_size),
+        )
+        worker._nixl_handshake("localhost", 1234, 1, worker.REMOTE_ENGINE_ID)
+        assert (
+            worker._read_blocks(
+                read_spec=ReadSpec(0, ([1],), ([2],)),
+                dst_engine_id=worker.REMOTE_ENGINE_ID,
+                request_id="request",
+                remote_request_id="prefill",
+                local_xfer_side_handle=10,
+                local_dram_handle=None,
+                remote_xfer_side_handle=20,
+                expected_consumers=1,
+                awaiting_kvs=True,
+            )
+            == posted
+        )
+        assert transfer.call_args_list == [call(h) for h in transfers]
+        assert release.call_args_list == [call(h) for h in releases]
+        assert worker._recving_transfers == ({"request": tracked} if tracked else {})
+        assert worker._recv_failures == (set() if posted else {"request"})
 
 
 @contextlib.contextmanager
@@ -2682,6 +2766,94 @@ def test_hisparse_dram_rank0_only_dram_only_read_completes(recv_worker):
     worker.nixl_wrapper.send_notif.assert_called_once_with(
         "prefill", notif_msg=b"request:1"
     )
+
+
+def _split_read(worker):
+    worker._desc_is_dram_by_block_size = {16: np.array([True, True, False, False])}
+    worker._desc_pos_by_block_size = {16: np.array([0, 1, 0, 1])}
+    worker._read_blocks_mixed(
+        request_id="request",
+        local_block_size_key=16,
+        local_device_handle=20,
+        local_dram_handle=10,
+        remote_xfer_side_handle=30,
+        local_block_descs_ids=np.array([0, 2]),
+        remote_block_descs_ids=np.array([5, 7]),
+        notif_agent="prefill",
+        notif_id=b"request:1",
+    )
+
+
+@patch(f"{_PULL_WORKER}.NixlBackendError", _BackendError)
+def test_mixed_memory_read_retries_failed_half(recv_worker):
+    """Only the rejected half is re-prepared; the posted half is untouched."""
+    worker = recv_worker
+    wrapper = worker.nixl_wrapper
+    wrapper.make_prepped_xfer.side_effect = [101, 102, 103]
+    wrapper.transfer.side_effect = [None, _BackendError(), None]
+
+    _split_read(worker)
+
+    _, device_read, retry_read = wrapper.make_prepped_xfer.call_args_list
+    assert retry_read.args[:2] == ("READ", 20)
+    np.testing.assert_array_equal(retry_read.args[2], device_read.args[2])
+    np.testing.assert_array_equal(retry_read.args[4], device_read.args[4])
+    assert wrapper.transfer.call_args_list == [call(101), call(102), call(103)]
+    assert wrapper.release_xfer_handle.call_args_list == [call(102)]
+    assert worker._recving_transfers == {"request": [101, 103]}
+    assert worker._pending_recv_notifs == {"request": [("prefill", b"request:1")]}
+    wrapper.send_notif.assert_not_called()
+
+
+def test_mixed_memory_read_prep_failure_posts_nothing(recv_worker):
+    """A preparation error on either half must leave no READ in flight."""
+    worker = recv_worker
+    wrapper = worker.nixl_wrapper
+    wrapper.make_prepped_xfer.side_effect = [101, RuntimeError("prep")]
+
+    with pytest.raises(RuntimeError, match="prep"):
+        _split_read(worker)
+
+    wrapper.transfer.assert_not_called()
+    assert wrapper.release_xfer_handle.call_args_list == [call(101)]
+    assert "request" not in worker._recving_transfers
+    assert "request" not in worker._pending_recv_notifs
+
+
+@patch(f"{_PULL_WORKER}.NixlBackendError", _BackendError)
+def test_mixed_memory_read_exhausted_releases_unstarted_half(recv_worker):
+    """Exhausting the first half releases the prepared, never-posted second."""
+    worker = recv_worker
+    wrapper = worker.nixl_wrapper
+    wrapper.make_prepped_xfer.side_effect = [101, 102, 103, 104, 105, 106]
+    wrapper.transfer.side_effect = _BackendError()
+
+    with pytest.raises(_BackendError):
+        _split_read(worker)
+
+    assert wrapper.transfer.call_args_list == [
+        call(h) for h in (101, 103, 104, 105, 106)
+    ]
+    assert wrapper.release_xfer_handle.call_args_list == [
+        call(h) for h in (101, 103, 104, 105, 106, 102)
+    ]
+    assert "request" not in worker._recving_transfers
+
+
+@patch(f"{_PULL_WORKER}.NixlBackendError", _BackendError)
+def test_read_resubmission_prep_failure_keeps_backend_error(recv_worker):
+    """A failed re-preparation is raised with the backend error as context."""
+    worker = recv_worker
+    backend_error = _BackendError("backend")
+    worker.nixl_wrapper.transfer.side_effect = backend_error
+    reprep = MagicMock(side_effect=RuntimeError("prep"))
+
+    with pytest.raises(RuntimeError, match="prep") as excinfo:
+        worker._submit_read("request", 101, reprep)
+
+    assert excinfo.value.__context__ is backend_error
+    assert worker.nixl_wrapper.release_xfer_handle.call_args_list == [call(101)]
+    assert "request" not in worker._recving_transfers
 
 
 def element_byte_addrs(view: torch.Tensor) -> list[int]:

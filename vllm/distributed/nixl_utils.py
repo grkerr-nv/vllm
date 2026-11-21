@@ -14,6 +14,7 @@ logger = init_logger(__name__)
 
 # declaration for static analyzers
 NixlWrapper: Any
+NixlBackendError: Any
 nixl_agent_config: Any
 nixlXferTelemetry: Any
 
@@ -43,7 +44,7 @@ def _get_nixl_package_name() -> str:
 
 def _get_nixl_module_name(name: str) -> str:
     package_name = _get_nixl_package_name()
-    if name == "nixlXferTelemetry":
+    if name in ("nixlXferTelemetry", "NixlBackendError"):
         return f"{package_name}._bindings"
     return f"{package_name}._api"
 
@@ -51,11 +52,14 @@ def _get_nixl_module_name(name: str) -> str:
 def _load_nixl_attr(name: str) -> Any:
     attr_name = {
         "NixlWrapper": "nixl_agent",
+        "NixlBackendError": "nixlBackendError",
         "nixl_agent_config": "nixl_agent_config",
         "nixlXferTelemetry": "nixlXferTelemetry",
     }[name]
 
     _maybe_set_ucx_rcache_limit()
+    # An empty exception tuple catches nothing when NIXL is not installed.
+    default = () if name == "NixlBackendError" else None
     try:
         module = importlib.import_module(_get_nixl_module_name(name))
     except ImportError:
@@ -63,9 +67,9 @@ def _load_nixl_attr(name: str) -> Any:
             logger.warning_once("NIXL is not available")
         elif name == "nixl_agent_config":
             logger.warning_once("NIXL agent config is not available")
-        value = None
+        value = default
     else:
-        value = getattr(module, attr_name, None)
+        value = getattr(module, attr_name, default)
         if name == "NixlWrapper":
             if value is None:
                 logger.warning_once("NIXL is not available")
@@ -128,6 +132,7 @@ def alias_nixl_for_ray() -> None:
 
 __all__ = [
     "NixlWrapper",
+    "NixlBackendError",
     "nixl_agent_config",
     "nixlXferTelemetry",
     "is_nixl_available",
