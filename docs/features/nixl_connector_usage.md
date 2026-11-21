@@ -417,9 +417,10 @@ For multi-host DP deployment, only need to provide the host/port of the head ins
 
 The pull connector makes up to five submission attempts for each READ if NIXL
 raises a backend error. Before retrying, it releases the failed transfer handle
-and prepares a new one. If release fails, it retains the handle and blocks for
-cleanup and does not retry. Descriptor preparation errors and asynchronous
-completion errors are not retried. After submission attempts are exhausted, the
+and prepares a new one. If release fails, it keeps the handle and its KV blocks
+until release succeeds, and does not retry. Descriptor preparation errors,
+other NIXL errors such as remote disconnects, and asynchronous completion
+errors are not retried. After submission attempts are exhausted, the
 configured KV load failure policy applies.
 
 The `kv_load_failure_policy` setting controls how the system handles failures when the decoder instance loads KV cache blocks from the prefiller instance:

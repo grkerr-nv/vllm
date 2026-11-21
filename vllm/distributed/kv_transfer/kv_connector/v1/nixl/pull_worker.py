@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
+import functools
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -598,14 +600,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     notif_id=notif_id,
                 )
                 return True
-            handle = self._post_read(
-                request_id,
+            prep = functools.partial(
+                self._prep_read,
                 local_xfer_side_handle,
                 local_block_descs_ids,
                 remote_xfer_side_handle,
                 remote_block_descs_ids,
                 notif_msg=notif_id,
             )
+            handle = self._submit_read(request_id, prep(), prep)
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
@@ -622,47 +625,59 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._handle_failed_transfer(request_id, None, self._recv_failures)
             return False
 
-    def _post_read(
+    def _prep_read(
         self,
-        request_id: str,
         local_xfer_side_handle: int,
         local_block_descs_ids: np.ndarray,
         remote_xfer_side_handle: int,
         remote_block_descs_ids: np.ndarray,
         notif_msg: bytes = b"",
     ) -> int:
-        """Retry READ submission only after the failed handle is released."""
-        for attempt in range(_READ_SUBMISSION_ATTEMPTS):
-            handle = self.nixl_wrapper.make_prepped_xfer(
-                "READ",
-                local_xfer_side_handle,
-                local_block_descs_ids,
-                remote_xfer_side_handle,
-                remote_block_descs_ids,
-                notif_msg=notif_msg,
-            )
+        return self.nixl_wrapper.make_prepped_xfer(
+            "READ",
+            local_xfer_side_handle,
+            local_block_descs_ids,
+            remote_xfer_side_handle,
+            remote_block_descs_ids,
+            notif_msg=notif_msg,
+        )
+
+    def _submit_read(
+        self, request_id: str, handle: int, reprep: Callable[[], int]
+    ) -> int:
+        """Start a prepared READ, retrying NIXL backend errors on a new handle.
+
+        A failed handle is released before `reprep` prepares its replacement,
+        and is never reposted. Retrying is safe for READs only, and relies on
+        NIXL's UCX backend (checked against NIXL 1.6.0): a failed post never
+        sends the completion notification, which goes out only after a
+        successful flush; and a retry from the same thread runs on the same
+        UCX endpoint, so its flush also waits for any reads a partial post
+        left in flight. Those reads write the same bytes as the retry.
+        """
+        for attempt in range(1, _READ_SUBMISSION_ATTEMPTS + 1):
             try:
-                # Begin async xfer.
                 self.nixl_wrapper.transfer(handle)
                 return handle
             except Exception as error:
                 if not self._try_release_xfer_handle(request_id, handle):
                     self._recving_transfers[request_id].append(handle)
                     raise
-                if (
-                    not isinstance(error, NixlBackendError)
-                    or attempt + 1 == _READ_SUBMISSION_ATTEMPTS
+                if attempt == _READ_SUBMISSION_ATTEMPTS or not isinstance(
+                    error, NixlBackendError
                 ):
                     raise
                 logger.warning(
                     "NIXL READ submission failed for request %s; "
                     "retrying attempt %d/%d: %s",
                     request_id,
-                    attempt + 2,
+                    attempt + 1,
                     _READ_SUBMISSION_ATTEMPTS,
                     error,
                 )
-        raise AssertionError("READ submission attempts must be positive")
+                # A preparation error here keeps the backend error as context.
+                handle = reprep()
+        raise AssertionError("unreachable")
 
     def _read_blocks_mixed(
         self,
@@ -697,20 +712,45 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             (is_dram, local_dram_handle),
             (~is_dram, local_device_handle),
         )
-        self._pending_recv_notifs.setdefault(request_id, []).append(
-            (notif_agent, notif_id)
-        )
+        preps: list[Callable[[], int]] = []
         for mask, local_handle in reads:
             if mask.any():
                 assert local_handle is not None
-                handle = self._post_read(
-                    request_id,
-                    local_handle,
-                    desc_pos[local_ids[mask]],
-                    remote_xfer_side_handle,
-                    remote_ids[mask],
+                preps.append(
+                    functools.partial(
+                        self._prep_read,
+                        local_handle,
+                        desc_pos[local_ids[mask]],
+                        remote_xfer_side_handle,
+                        remote_ids[mask],
+                    )
                 )
-                self._recving_transfers[request_id].append(handle)
+
+        # Prepare every READ before posting any, so a preparation error leaves
+        # nothing in flight.
+        handles: list[int] = []
+        try:
+            for prep in preps:
+                handles.append(prep())
+        except Exception:
+            for handle in handles:
+                if not self._try_release_xfer_handle(request_id, handle):
+                    self._recving_transfers[request_id].append(handle)
+            raise
+
+        self._pending_recv_notifs.setdefault(request_id, []).append(
+            (notif_agent, notif_id)
+        )
+        for i, (handle, prep) in enumerate(zip(handles, preps)):
+            try:
+                handle = self._submit_read(request_id, handle, prep)
+            except Exception:
+                # _submit_read disposed of its own handle; release the rest.
+                for unstarted in handles[i + 1 :]:
+                    if not self._try_release_xfer_handle(request_id, unstarted):
+                        self._recving_transfers[request_id].append(unstarted)
+                raise
+            self._recving_transfers[request_id].append(handle)
 
     def _get_new_notifs(self) -> set[str]:
         """Get req_ids which got a remote xfer message. When multiple consumers
